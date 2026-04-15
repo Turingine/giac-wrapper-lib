@@ -3,13 +3,14 @@ const builtin = @import("builtin");
 
 const process_command: []const []const u8 = &[_][]const u8 { "giac" };
 const millisecond = std.time.ns_per_ms;
-const wait_time = 20 * millisecond;
+const wait_time = 40 * millisecond;
 const max_output_bytes = 1024;
-const Enum = enum { stdout, stderr };
 const debug = builtin.mode == .Debug;
 
+const Channels = enum { stdout, stderr };
+
 subprocess: std.process.Child,
-poller: *std.Io.Poller(Enum),
+poller: *std.Io.Poller(Channels),
 stdout: *std.Io.Reader,
 stderr: *std.Io.Reader,
 
@@ -22,9 +23,9 @@ pub fn openInstance(allocator: std.mem.Allocator) !@This() {
 
     try child.spawn();
 
-    var poller = try allocator.create(std.Io.Poller(Enum));
+    var poller = try allocator.create(std.Io.Poller(Channels));
 
-    poller.* = std.Io.poll(allocator, Enum, .{
+    poller.* = std.Io.poll(allocator, Channels, .{
         .stdout = child.stdout.?,
         .stderr = child.stderr.?,
     });
@@ -46,21 +47,62 @@ pub fn openInstance(allocator: std.mem.Allocator) !@This() {
     };
 }
 
+const ReadMode = enum {
+    // discards from the other stream to free memory
+    stdout,
+    stderr,
+    // Returns a string without specifying the origin stream
+    mixed,
+    // return a tuple containing the origin stream and the read content
+    both,
+
+    // Returns a bool indicating if both channels match
+    fn cmp(mode: ReadMode, origin: Channels) bool {
+        return switch (mode) {
+            .stdout => origin == .stdout,
+            .stderr => origin == .stderr,
+            else => true,
+        };
+    }
+};
+
+fn ReadReturnType(mode: ReadMode) type {
+    return switch (mode) {
+        .stdout, .stderr, .mixed => []const u8,
+        .both => .{ Channels, []const u8 }, 
+    };
+}
+
+fn wrapResult(comptime mode: ReadMode, origin: Channels, content: []const u8) ?ReadReturnType(mode) {
+    return switch (mode) {
+        .stdout, .stderr, .mixed => blk: {
+            if (mode.cmp(origin)) {
+                break :blk content;
+            } else break :blk null;
+        },
+        .both => .{ origin, content },
+    };
+} 
+
 // Comportement similaire a collectOutput, mais renvoie simplement une seule ligne de la sortie
 // avec un timeout predefini
-pub fn readLine(self: *@This()) ![]const u8 {
+pub fn readLine(self: *@This(), comptime mode: ReadMode) !ReadReturnType(mode) {
     {
         const stdout: []const u8 = self.stdout.buffer[self.stdout.seek..self.stdout.end];
         const stderr: []const u8 = self.stderr.buffer[self.stderr.seek..self.stderr.end];
 
         if (std.mem.indexOfScalar(u8, stdout, '\n')) |index| {
             self.stdout.seek += index + 1;
-            return stdout[0..index];
+            if (wrapResult(mode, .stdout, stdout[0..index])) |result| {
+                return result;
+            } else {}
         }
 
         if (std.mem.indexOfScalar(u8, stderr, '\n')) |index| {
             self.stderr.seek += index + 1;
-            return stderr[0..index];
+            if (wrapResult(mode, .stderr, stderr[0..index])) |result| {
+                return result;
+            } else {}
         }
     }
     var timer = std.time.Timer.start() catch |err| {
@@ -79,12 +121,16 @@ pub fn readLine(self: *@This()) ![]const u8 {
 
         if (std.mem.indexOfScalar(u8, stdout, '\n')) |index| {
             self.stdout.seek += index + 1;
-            return stdout[0..index];
+            if (wrapResult(mode, .stdout, stdout[0..index])) |result| {
+                return result;
+            } else {}
         }
 
         if (std.mem.indexOfScalar(u8, stderr, '\n')) |index| {
             self.stderr.seek += index + 1;
-            return stderr[0..index];
+            if (wrapResult(mode, .stderr, stderr[0..index])) |result| {
+                return result;
+            } else {}
         }
     }
     return error.Timeout;
@@ -93,10 +139,12 @@ pub fn readLine(self: *@This()) ![]const u8 {
 pub fn skipLines(self: *@This()) void {
     var line_count: if (debug) usize else u0 = 0;
     while (true) {
-        _ = self.readLine() catch break;
+        _ = self.readLine(.mixed) catch |err| {
+            if (debug) std.debug.print("Ended skip with error: {t}\n", .{ err });
+            break;
+        };
         if (debug) line_count += 1;
     }
-    // Commentaire: ceci est une bibliographie. Si si, je vous jure :)
     if (debug) std.debug.print("Lines skipped: {d}\n", .{ line_count });
 }
 
@@ -113,7 +161,7 @@ pub fn filterResult(return_string: []const u8) bool {
 // Renvoie le resultat d'une commande fournie en entree
 fn run(self: *@This()) ![]const u8 {
     while (true) {
-        const line = self.readLine() catch break;
+        const line = self.readLine(.stdout) catch break;
         if (filterResult(line)) {
             if (debug) std.debug.print("Skipped line: {s}\n", .{ line });
         } else {
@@ -124,8 +172,6 @@ fn run(self: *@This()) ![]const u8 {
     return error.NoResult;
 }
 
-// n'ecoutez pas Kamil ceci est une BIBLIOGRAPHIE, pas un code !!!!
-// ABRACADABRA
 // The returned memory belongs to the poller, it is not guaranteed to remain valid after further reads
 // User should clone if longer lived memory is needed
 pub fn runCommand(self: *@This(), command: []const u8) ![]const u8 {
