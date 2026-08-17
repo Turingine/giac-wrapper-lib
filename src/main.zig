@@ -1,7 +1,7 @@
 const std = @import("std");
 const giac_wrapper_lib = @import("giac_wrapper_lib");
 
-const commands = &[_][]const u8 {
+const commands = &[_][]const u8{
     "3 + 7 / 2",
     "sin(1/x)",
     "sin(1/5)",
@@ -10,11 +10,8 @@ const commands = &[_][]const u8 {
     "x",
 };
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = gpa.allocator();
-
-    var child = try giac_wrapper_lib.Process.openInstance(allocator);
+pub fn main(init: std.process.Init) !void {
+    var child = try giac_wrapper_lib.Process.openInstance(init.gpa, init.io);
     child.skipLines();
 
     _ = child.runCommand("x := 5") catch {};
@@ -23,6 +20,6 @@ pub fn main() !void {
         const line = child.approximate(command, 4);
         std.debug.print("Command: {s}\nResult: {!s}\n", .{ command, line });
     }
-    
-    try child.closeInstance(allocator);
+
+    try child.closeInstance(init.gpa);
 }

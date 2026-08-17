@@ -4,46 +4,66 @@ const builtin = @import("builtin");
 const process_command: []const []const u8 = &[_][]const u8 { "giac" };
 const millisecond = std.time.ns_per_ms;
 const wait_time = 40 * millisecond;
-const max_output_bytes = 1024;
+const reserve_amount = 1024;
 const debug = builtin.mode == .Debug;
 
 const Channels = enum { stdout, stderr };
 
-subprocess: std.process.Child,
-poller: *std.Io.Poller(Channels),
-stdout: *std.Io.Reader,
-stderr: *std.Io.Reader,
+// subprocess: std.process.Child,
+// poller: *std.Io.Poller(Channels),
+// stdout: *std.Io.Reader,
+// stderr: *std.Io.Reader,
+multi_reader_buffer: std.Io.File.MultiReader.Buffer(2),
+multi_reader: std.Io.File.MultiReader,
+stdout_limit: std.Io.Limit = .limited(65536),
+stderr_limit: std.Io.Limit = .limited(65536),
 
-pub fn openInstance(allocator: std.mem.Allocator) !@This() {
-    var child = std.process.Child.init(process_command, allocator);
-
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    var poller = try allocator.create(std.Io.Poller(Channels));
-
-    poller.* = std.Io.poll(allocator, Channels, .{
-        .stdout = child.stdout.?,
-        .stderr = child.stderr.?,
+pub fn openInstance(gpa: std.mem.Allocator, io: std.Io) !@This() {
+    const child = try std.process.spawn(io, .{
+        .argv = &[_][]const u8 { "giac" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
     });
+    errdefer child.kill(io);
 
-    const stdout_r = poller.reader(.stdout);
-    const stderr_r = poller.reader(.stderr);
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    errdefer multi_reader.deinit();
 
-    for (&[_]*std.Io.Reader { stdout_r, stderr_r }) |reader| {
-        reader.buffer = &.{};
-        reader.seek = 0;
-        reader.end = 0;
-    }
+    // while (multi_reader.fill(reserve_amount, wait_time)) |_| {
+    //     if (options.stdout_limit.toInt()) |limit| {
+    //         if (stdout_reader.buffered().len > limit)
+    //            return error.StreamTooLong;
+    //    }
+    //    if (options.stderr_limit.toInt()) |limit| {
+    //        if (stderr_reader.buffered().len > limit)
+    //            return error.StreamTooLong;
+    //    }
+    //} else |err| switch (err) {
+    //    error.EndOfStream => {},
+    //    else => |e| return e,
+   // }
 
+   // try multi_reader.checkAnyError();
+
+//    const term = try child.wait(io);
+
+//    const stdout_slice = try multi_reader.toOwnedSlice(0);
+ //   errdefer gpa.free(stdout_slice);
+
+//    const stderr_slice = try multi_reader.toOwnedSlice(1);
+ //   errdefer gpa.free(stderr_slice);
+
+//    return .{
+ //       .stdout = stdout_slice,
+ //       .stderr = stderr_slice,
+ //       .term = term,
+ //   };
     return .{
-        .subprocess = child,
-        .poller = poller,
-        .stdout = poller.reader(.stdout),
-        .stderr = poller.reader(.stderr),
+        .multi_reader = multi_reader,
+        .multi_reader_buffer = multi_reader_buffer,
     };
 }
 
@@ -84,12 +104,14 @@ fn wrapResult(comptime mode: ReadMode, origin: Channels, content: []const u8) ?R
     };
 } 
 
-// Comportement similaire a collectOutput, mais renvoie simplement une seule ligne de la sortie
+// Comportement similaire a run, mais renvoie simplement une seule ligne de la sortie
 // avec un timeout predefini
 pub fn readLine(self: *@This(), comptime mode: ReadMode) !ReadReturnType(mode) {
+    const stdout_reader = self.multi_reader.reader(0);
+    const stderr_reader = self.multi_reader.reader(0);
     {
-        const stdout: []const u8 = self.stdout.buffer[self.stdout.seek..self.stdout.end];
-        const stderr: []const u8 = self.stderr.buffer[self.stderr.seek..self.stderr.end];
+        const stdout: []const u8 = stdout_reader.buffered();
+        const stderr: []const u8 = stderr_reader.buffered();
 
         if (std.mem.indexOfScalar(u8, stdout, '\n')) |index| {
             self.stdout.seek += index + 1;
@@ -110,14 +132,18 @@ pub fn readLine(self: *@This(), comptime mode: ReadMode) !ReadReturnType(mode) {
         return err;
     };
 
-    while (try self.poller.pollTimeout(wait_time) and timer.read() < wait_time) {
-        if (self.stdout.bufferedLen() > max_output_bytes)
-            return error.StdoutStreamTooLong;
-        if (self.stderr.bufferedLen() > max_output_bytes)
-            return error.StderrStreamTooLong;
+    while (self.multi_reader.fill(reserve_amount, wait_time)) |_| {
+        if (self.stdout_limit.toInt()) |limit| {
+            if (stdout_reader.buffered().len > limit)
+                return error.StreamTooLong;
+        }
+        if (self.stderr_limit.toInt()) |limit| {
+            if (stderr_reader.buffered().len > limit)
+                return error.StreamTooLong;
+        }
 
-        const stdout: []const u8 = self.stdout.buffer[self.stdout.seek..self.stdout.end];
-        const stderr: []const u8 = self.stderr.buffer[self.stderr.seek..self.stderr.end];
+        const stdout: []const u8 = stdout_reader.buffer[self.stdout.seek..self.stdout.end];
+        const stderr: []const u8 = stderr_reader.buffer[self.stderr.seek..self.stderr.end];
 
         if (std.mem.indexOfScalar(u8, stdout, '\n')) |index| {
             self.stdout.seek += index + 1;
@@ -132,7 +158,11 @@ pub fn readLine(self: *@This(), comptime mode: ReadMode) !ReadReturnType(mode) {
                 return result;
             } else {}
         }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
     }
+
     return error.Timeout;
 }
 
@@ -150,12 +180,12 @@ pub fn skipLines(self: *@This()) void {
 
 pub fn filterResult(return_string: []const u8) bool {
     if (
-        std.mem.startsWith(u8, return_string, "// ") or
-        std.mem.startsWith(u8, return_string, "Warning")
-    ) return true;
+    std.mem.startsWith(u8, return_string, "// ") or
+    std.mem.startsWith(u8, return_string, "Warning")
+) return true;
 
     return
-        std.mem.indexOf(u8, return_string, ">> ") != null;
+    std.mem.indexOf(u8, return_string, ">> ") != null;
 }
 
 // Renvoie le resultat d'une commande fournie en entree
@@ -179,7 +209,8 @@ pub fn runCommand(self: *@This(), command: []const u8) ![]const u8 {
     _ = try self.subprocess.stdin.?.write("\n");
     return self.run();
 }
-    
+
+// Some expressions are known to badly work with this(ex: evalf(x:=5,4) considers x as a tuple)
 pub fn approximate(self: *@This(), expression: []const u8, decimals: usize) ![]const u8 {
     var buffer: [256]u8 = undefined;
     var writer = self.subprocess.stdin.?.writer(&buffer);
