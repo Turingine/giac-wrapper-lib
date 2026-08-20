@@ -1,5 +1,5 @@
 const std = @import("std");
-const giac_wrapper_lib = @import("giac_wrapper_lib");
+const giac_wrapper_lib = @import("giac_wrapper");
 
 const commands = &[_][]const u8{
     "3 + 7 / 2",
@@ -11,15 +11,12 @@ const commands = &[_][]const u8{
 };
 
 pub fn main(init: std.process.Init) !void {
-    var child = try giac_wrapper_lib.Process.openInstance(init.gpa, init.io);
-    child.skipLines();
-
-    _ = child.runCommand("x := 5") catch {};
-
     for (commands) |command| {
-        const line = child.approximate(command, 4);
-        std.debug.print("Command: {s}\nResult: {!s}\n", .{ command, line });
+        const result = giac_wrapper_lib.eval(init.gpa, command) catch |err| {
+            std.debug.print("Command: {s} failed with: {t}\n", .{ command, err });
+            continue;
+        };
+        defer init.gpa.free(result);
+        std.debug.print("Command: {s}\nResult: {s}\n", .{ command, result });
     }
-
-    try child.closeInstance(init.gpa);
 }
