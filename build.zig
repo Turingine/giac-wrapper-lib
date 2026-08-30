@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const use_llvm = b.option(bool, "use_llvm", "Enable to force use of llvm");
+    const use_lld = b.option(bool, "use_lld", "Enable to force use of lld");
+
     const mod = b.addModule("giac_wrapper", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -15,8 +18,8 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "test_file",
         // See https://codeberg.org/ziglang/zig/issues/31272
-        .use_lld = true,
-        .use_llvm = true,
+        .use_lld = use_lld,
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
